@@ -4,272 +4,354 @@ import pandas as pd
 import plotly.graph_objs as go
 import numpy as np
 
-# --- 页面配置 ---
-st.set_page_config(page_title="AI 股票终极分析", layout="wide")
-st.title("📈 股票终极分析：技术趋势 + 双重估值模型")
+# --- 1. 页面配置 & CSS 美化 ---
+st.set_page_config(page_title="AI 深度投研终端", layout="wide", page_icon="📈")
 
-# --- 侧边栏：全局设置 ---
-with st.sidebar:
-    st.header("1. 股票设置")
-    ticker = st.text_input("股票代码", value="NVDA", help="美股: TSLA | A股: 600519.SS | 港股: 0700.HK")
+# 注入自定义 CSS 以美化 UI
+st.markdown("""
+    <style>
+    /* 全局背景微调 */
+    .stApp {
+        background-color: #0E1117;
+    }
     
-    st.header("2. 估值核心假设")
-    # 这个增长率将同时影响 PE推导 和 DCF计算
-    global_growth_rate = st.slider("预期未来3-5年增长率 (%)", 0, 80, 15, help="这是决定估值最重要的参数")
-    discount_rate = st.slider("折现率 (WACC) (%)", 5, 15, 9, help="DCF模型使用的预期回报率")
-    terminal_growth = st.slider("永续增长率 (%)", 1, 5, 3, help="DCF模型终值阶段的增长率")
-    
-    st.divider()
-    st.caption("数据来源：Yahoo Finance")
+    /* 卡片样式 */
+    .metric-card {
+        background-color: #1E1E25;
+        border: 1px solid #2E2E38;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 15px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    .metric-label {
+        font-size: 0.9rem;
+        color: #A0A0A0;
+        margin-bottom: 5px;
+    }
+    .metric-value {
+        font-size: 1.6rem;
+        font-weight: bold;
+        color: #FFFFFF;
+    }
+    .metric-delta-up { color: #00E676; font-size: 0.9rem; }
+    .metric-delta-down { color: #FF1744; font-size: 0.9rem; }
 
-# --- 核心算法函数 ---
+    /* 估值结果卡片 */
+    .val-card {
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 10px;
+        border-left: 4px solid #555;
+        background-color: #262730;
+    }
+    
+    /* 调整 Sidebar */
+    [data-testid="stSidebar"] {
+        background-color: #16161D;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- 2. 核心数据获取与计算 ---
 
 @st.cache_data(ttl=3600)
 def get_stock_data(symbol):
     try:
         stock = yf.Ticker(symbol)
-        hist = stock.history(period="2y") # 获取2年数据以计算支撑压力
+        hist = stock.history(period="2y")
         try:
             info = stock.info
+            # 获取财务报表用于计算 CAGR
+            financials = stock.income_stmt
         except:
             info = {}
-        return hist, info
+            financials = pd.DataFrame()
+        return hist, info, financials
     except:
-        return None, None
+        return None, None, None
+
+def calculate_historical_cagr(financials):
+    """
+    计算历史 EPS 和 Revenue 的 CAGR (3-4年)
+    """
+    metrics = {"eps_cagr": 0.0, "rev_cagr": 0.0, "years": 0}
+    
+    if financials is None or financials.empty:
+        return metrics
+    
+    try:
+        # 获取 Diluted EPS (部分财报 key 可能不同，做容错)
+        # 按照列名（日期）排序，新的在左，旧的在右
+        financials = financials.sort_index(axis=1, ascending=False)
+        
+        # 尝试获取最近一年和最远一年（通常yfinance给4年）
+        cols = financials.columns
+        if len(cols) >= 3:
+            latest_year = cols[0]
+            oldest_year = cols[-1]
+            num_years = len(cols) - 1
+            metrics['years'] = num_years
+            
+            # --- 计算 EPS CAGR ---
+            try:
+                eps_row = financials.loc['Diluted EPS']
+                end_val = eps_row[latest_year]
+                start_val = eps_row[oldest_year]
+                
+                # 只有当起始和结束都是正数时，CAGR才有意义
+                if start_val > 0 and end_val > 0:
+                    cagr = (end_val / start_val) ** (1 / num_years) - 1
+                    metrics['eps_cagr'] = cagr * 100
+            except:
+                pass
+
+            # --- 计算 Revenue CAGR ---
+            try:
+                # 尝试不同的 Total Revenue 标签
+                rev_key = 'Total Revenue' if 'Total Revenue' in financials.index else 'Total Income'
+                if rev_key in financials.index:
+                    rev_row = financials.loc[rev_key]
+                    end_val = rev_row[latest_year]
+                    start_val = rev_row[oldest_year]
+                    if start_val > 0 and end_val > 0:
+                        cagr = (end_val / start_val) ** (1 / num_years) - 1
+                        metrics['rev_cagr'] = cagr * 100
+            except:
+                pass
+                
+    except Exception as e:
+        print(f"CAGR Calculation Error: {e}")
+        
+    return metrics
 
 def calculate_sr_levels(df, sensitivity=0.02):
-    """识别支撑和压力位并计算强度"""
+    """技术分析：计算支撑压力位"""
     levels = []
-    # 寻找局部极值
     for i in range(2, len(df) - 2):
-        # 支撑 (Low point)
         if df['Low'][i] < df['Low'][i-1] and df['Low'][i] < df['Low'][i+1] and \
            df['Low'][i] < df['Low'][i-2] and df['Low'][i] < df['Low'][i+2]:
             levels.append((df['Low'][i], 1))
-        # 压力 (High point)
         if df['High'][i] > df['High'][i-1] and df['High'][i] > df['High'][i+1] and \
            df['High'][i] > df['High'][i-2] and df['High'][i] > df['High'][i+2]:
             levels.append((df['High'][i], 2))
-
     levels.sort(key=lambda x: x[0])
-    
-    # 聚类合并
-    merged_levels = []
+    merged = []
     if not levels: return []
-    
-    current_group = [levels[0]]
+    curr = [levels[0]]
     for i in range(1, len(levels)):
-        price, type_ = levels[i]
-        last_avg = sum([x[0] for x in current_group]) / len(current_group)
-        
-        if abs(price - last_avg) / last_avg <= sensitivity:
-            current_group.append(levels[i])
+        if abs(levels[i][0] - sum(x[0] for x in curr)/len(curr))/(sum(x[0] for x in curr)/len(curr)) <= sensitivity:
+            curr.append(levels[i])
         else:
-            avg_price = sum([x[0] for x in current_group]) / len(current_group)
-            merged_levels.append({'price': avg_price, 'strength': len(current_group)})
-            current_group = [levels[i]]
-            
-    avg_price = sum([x[0] for x in current_group]) / len(current_group)
-    merged_levels.append({'price': avg_price, 'strength': len(current_group)})
-    
-    return merged_levels
+            merged.append({'price': sum(x[0] for x in curr)/len(curr), 'strength': len(curr)})
+            curr = [levels[i]]
+    merged.append({'price': sum(x[0] for x in curr)/len(curr), 'strength': len(curr)})
+    return merged
 
-def calculate_pe_range(eps, growth_rate):
-    """基于格雷厄姆公式和PEG推导合理PE区间"""
-    base_pe_const = 8.5
-    
-    # 1. 保守 (Bear)
-    bear_pe = max(10.0, base_pe_const + (1.0 * growth_rate))
-    
-    # 2. 中性 (Base) - 格雷厄姆公式
-    base_target_pe = base_pe_const + (2.0 * growth_rate)
-    
-    # 3. 乐观 (Bull)
-    bull_pe = base_target_pe * 1.25
-    
-    # 修正高增长情况 (当增长率>20%时，格雷厄姆公式会给过高PE，转用PEG修正)
-    if growth_rate > 20:
-        bear_pe = growth_rate * 1.0  # PEG=1
-        base_target_pe = growth_rate * 1.5 # PEG=1.5
-        bull_pe = growth_rate * 2.0  # PEG=2.0
-        
-    return {
-        "bear": eps * bear_pe,
-        "base": eps * base_target_pe,
-        "bull": eps * bull_pe,
-        "pe_multipliers": (bear_pe, base_target_pe, bull_pe)
-    }
+# --- 3. 主逻辑 ---
 
-def calculate_dcf(eps, growth_rate, discount_rate, terminal_growth, years=5):
-    """DCF 现金流折现模型"""
-    flows = []
-    future_eps = eps
-    # 1. 增长期
-    for i in range(1, years + 1):
-        future_eps = future_eps * (1 + growth_rate / 100)
-        discounted_flow = future_eps / ((1 + discount_rate / 100) ** i)
-        flows.append(discounted_flow)
+with st.sidebar:
+    st.markdown("## ⚙️ 参数设置")
+    ticker = st.text_input("股票代码", value="NVDA")
+    st.caption("支持美股/港股/A股 (如 600519.SS)")
     
-    # 2. 永续期 (Terminal Value)
-    # 公式: [Final EPS * (1+g)] / (r - g)
-    terminal_value = (future_eps * (1 + terminal_growth / 100)) / ((discount_rate - terminal_growth) / 100)
-    discounted_terminal_value = terminal_value / ((1 + discount_rate / 100) ** years)
-    
-    return sum(flows) + discounted_terminal_value
+    st.markdown("---")
+    st.markdown("### 🛠️ 估值模型假设")
+    # 初始化占位，后面获取数据后会更新 key
+    user_discount_rate = st.slider("折现率 WACC (%)", 5.0, 15.0, 9.0, 0.5)
+    user_terminal_growth = st.slider("永续增长率 (%)", 1.0, 5.0, 3.0, 0.5)
 
-# --- 主逻辑 ---
 if ticker:
-    with st.spinner('正在整合技术面与基本面数据...'):
-        df, info = get_stock_data(ticker)
-
-    if df is not None and not df.empty:
-        current_price = df['Close'].iloc[-1]
-        auto_eps = info.get('trailingEps', 1.0)
-        if not auto_eps: auto_eps = 1.0 # 容错
-
+    with st.spinner('正在挖掘历史财报与行情数据...'):
+        hist, info, financials = get_stock_data(ticker)
+        
+    if hist is not None:
+        # --- 数据预处理 ---
+        curr_price = hist['Close'].iloc[-1]
+        prev_close = hist['Close'].iloc[-2]
+        price_change = (curr_price - prev_close) / prev_close * 100
+        
+        # 获取历史 CAGR
+        cagr_data = calculate_historical_cagr(financials)
+        hist_eps_cagr = cagr_data.get('eps_cagr', 0)
+        hist_rev_cagr = cagr_data.get('rev_cagr', 0)
+        
+        # 确定默认增长率：优先用分析师预期，其次用历史EPS CAGR，最后兜底10%
+        analyst_growth = info.get('earningsGrowth', 0) * 100 if info.get('earningsGrowth') else 0
+        default_growth = analyst_growth if analyst_growth > 0 else (hist_eps_cagr if hist_eps_cagr > 0 else 10.0)
+        
         # ==========================================
-        # 1. 技术分析板块 (K线 + 5档压力支撑)
+        # Header: 关键指标卡片
         # ==========================================
-        st.subheader(f"📉 {ticker} 技术分析：关键点位")
+        st.title(f"{info.get('shortName', ticker)} ({ticker})")
         
-        # 计算点位
-        sr_data = calculate_sr_levels(df, sensitivity=0.02)
-        # 支撑：价格 < 现价，按价格从高到低排 (离现价最近的在前)
-        supports = sorted([x for x in sr_data if x['price'] < current_price], key=lambda x: x['price'], reverse=True)
-        # 压力：价格 > 现价，按价格从低到高排 (离现价最近的在前)
-        resistances = sorted([x for x in sr_data if x['price'] > current_price], key=lambda x: x['price'])
+        m1, m2, m3, m4 = st.columns(4)
         
-        # 1.1 展示 5 个压力/支撑区间
-        col_tech1, col_tech2 = st.columns(2)
-        
-        with col_tech1:
-            st.markdown("#### 🟢 下方强支撑 (Top 5)")
-            if supports:
-                for i, s in enumerate(supports[:5]): # 只取前5
-                    dist = (s['price'] - current_price) / current_price * 100
-                    stars = "⭐" * min(s['strength'], 5)
-                    st.info(f"Support {i+1}: **{s['price']:.2f}** (距离 {dist:.1f}%) | 强度: {stars}")
-            else:
-                st.write("下方暂无明显历史支撑")
-                
-        with col_tech2:
-            st.markdown("#### 🔴 上方强压力 (Top 5)")
-            if resistances:
-                for i, r in enumerate(resistances[:5]): # 只取前5
-                    dist = (r['price'] - current_price) / current_price * 100
-                    stars = "⭐" * min(r['strength'], 5)
-                    st.warning(f"Resistance {i+1}: **{r['price']:.2f}** (距离 +{dist:.1f}%) | 强度: {stars}")
-            else:
-                st.write("上方暂无明显历史压力 (可能创新高)")
-
-        # 1.2 绘制 K 线图
-        with st.expander("查看交互式 K 线图 (含关键位)", expanded=True):
-            plot_df = df.iloc[-252:] # 最近一年
-            fig = go.Figure()
-            fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K线'))
-            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Close'].rolling(20).mean(), line=dict(color='orange', width=1), name='MA20'))
+        def metric_html(label, value, delta=None, suffix=""):
+            delta_html = ""
+            if delta is not None:
+                color = "metric-delta-up" if delta > 0 else "metric-delta-down"
+                sign = "+" if delta > 0 else ""
+                delta_html = f'<span class="{color}">{sign}{delta:.2f}%</span>'
             
-            # 画出最近的 3 个支撑和 3 个压力 (避免图表太乱)
-            lines_to_plot = supports[:3] + resistances[:3]
-            for level in lines_to_plot:
-                color = 'green' if level['price'] < current_price else 'red'
-                width = 1 + (min(level['strength'], 5) * 0.5)
-                fig.add_hline(y=level['price'], line_dash='dash', line_color=color, line_width=width, opacity=0.7)
-                
-            fig.update_layout(height=450, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(t=30,b=20,l=20,r=20))
-            st.plotly_chart(fig, use_container_width=True)
+            return f"""
+            <div class="metric-card">
+                <div class="metric-label">{label}</div>
+                <div class="metric-value">{value}{suffix}</div>
+                {delta_html}
+            </div>
+            """
 
-        st.divider()
+        with m1: st.markdown(metric_html("当前价格", f"{curr_price:.2f}", price_change), unsafe_allow_html=True)
+        with m2: st.markdown(metric_html("PE (TTM)", f"{info.get('trailingPE', 0):.2f}"), unsafe_allow_html=True)
+        with m3: st.markdown(metric_html("EPS (TTM)", f"{info.get('trailingEps', 0):.2f}"), unsafe_allow_html=True)
+        with m4: st.markdown(metric_html(f"历史{cagr_data['years']}年 EPS复合增长", f"{hist_eps_cagr:.1f}", suffix="%"), unsafe_allow_html=True)
+
+        st.markdown("---")
 
         # ==========================================
-        # 2. 双重估值板块 (PE区间 + DCF模型)
+        # Section 1: 双重估值模型 (更紧凑的布局)
         # ==========================================
-        st.subheader("💰 双重估值模型")
-        st.caption("结合市场情绪 (PE) 与 现金流折现 (DCF) 进行交叉验证")
-
-        # 输入参数微调区
+        st.subheader("💰 智能估值中心")
+        
+        # 估值控制栏 (放在一行)
         with st.container():
-            cols = st.columns(4)
-            user_eps = cols[0].number_input("EPS (TTM)", value=float(auto_eps), step=0.1)
-            user_growth = cols[1].number_input("增长率 (%)", value=float(global_growth_rate), step=0.5)
-            user_wacc = cols[2].number_input("折现率 WACC (%)", value=float(discount_rate), step=0.5)
-            user_tg = cols[3].number_input("永续增长 (%)", value=float(terminal_growth), step=0.1)
-
-        # --- 模型计算 ---
-        # A. PE 模型结果
-        pe_res = calculate_pe_range(user_eps, user_growth)
-        
-        # B. DCF 模型结果
-        dcf_val = calculate_dcf(user_eps, user_growth, user_wacc, user_tg)
-        dcf_upside = (dcf_val - current_price) / current_price * 100
-
-        # --- 结果展示 ---
-        val_c1, val_c2 = st.columns([1, 1])
-        
-        # 左侧：PE 估值矩阵
-        with val_c1:
-            st.markdown("### 1️⃣ 智能 PE 估值 (相对估值)")
-            st.markdown(f"基于增长率 **{user_growth}%** 推导合理 PE 区间")
+            st.markdown("#### 1. 确认核心假设")
+            c_in1, c_in2, c_in3 = st.columns([1, 1, 2])
             
-            # 构建 PE 结果数据
-            df_pe = pd.DataFrame({
-                "情景": ["🐻 保守 (Bear)", "⚖️ 合理 (Base)", "🐂 乐观 (Bull)"],
-                "隐含 PE": [f"{x:.1f}x" for x in pe_res['pe_multipliers']],
-                "估值价格": [pe_res['bear'], pe_res['base'], pe_res['bull']],
-            })
+            # 智能推荐增长率
+            growth_help = f"历史CAGR: {hist_eps_cagr:.1f}% | 分析师预期: {analyst_growth:.1f}%"
+            user_growth = c_in1.number_input("预期未来增长率 (%)", value=float(default_growth), step=0.5, help=growth_help)
+            user_eps = c_in2.number_input("基准 EPS", value=float(info.get('trailingEps', 1.0)), step=0.1)
+            c_in3.info(f"💡 **智能提示**：根据财报数据，该公司过去 {cagr_data['years']} 年营收增长 **{hist_rev_cagr:.1f}%**，利润增长 **{hist_eps_cagr:.1f}%**。建议保守取值。")
+
+        # --- 计算逻辑 ---
+        # PE 逻辑
+        base_pe = 8.5 + 2 * user_growth
+        if user_growth > 20: base_pe = user_growth * 1.5 # PEG修正
+        pe_targets = {'Bear': base_pe*0.8, 'Base': base_pe, 'Bull': base_pe*1.2}
+        pe_vals = {k: v * user_eps for k,v in pe_targets.items()}
+        
+        # DCF 逻辑
+        future_eps = user_eps
+        dcf_sum = 0
+        for i in range(1, 6):
+            future_eps *= (1 + user_growth/100)
+            dcf_sum += future_eps / ((1 + user_discount_rate/100)**i)
+        term_val = (future_eps * (1+user_terminal_growth/100)) / ((user_discount_rate - user_terminal_growth)/100)
+        dcf_val = dcf_sum + term_val / ((1 + user_discount_rate/100)**5)
+        
+        # --- 估值展示 ---
+        v_col1, v_col2 = st.columns(2)
+        
+        with v_col1:
+            st.markdown("#### 🅰️ 相对估值 (PE法)")
+            st.caption(f"基于增长率 {user_growth}% 推导合理 PE")
             
-            # 自定义展示
-            for i, row in df_pe.iterrows():
-                p = row['估值价格']
-                diff = (p - current_price) / current_price * 100
-                color = "red" if diff < -5 else ("green" if diff > 5 else "orange")
-                emoji = "📉" if diff < 0 else "📈"
-                
+            # 动态颜色函数
+            def get_color(target_price, current):
+                diff = (target_price - current) / current
+                if diff > 0.15: return "#00E676" # Green
+                if diff < -0.15: return "#FF1744" # Red
+                return "#FF9100" # Orange
+            
+            for scenario, val in pe_vals.items():
+                color = get_color(val, curr_price)
+                upside = (val - curr_price) / curr_price * 100
                 st.markdown(f"""
-                <div style="background-color: #262730; padding: 10px; border-radius: 5px; margin-bottom: 8px; border-left: 5px solid {color}">
-                    <div style="display:flex; justify-content:space-between;">
-                        <span>{row['情景']} <small style="color:gray">({row['隐含 PE']})</small></span>
-                        <span style="font-weight:bold; font-size:1.1em">${p:.2f}</span>
+                <div class="val-card" style="border-left-color: {color};">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-size:1rem; font-weight:bold;">{scenario} (PE {pe_targets[scenario]:.1f}x)</span>
+                        <span style="font-size:1.2rem; color:#FFF;">${val:.2f}</span>
                     </div>
-                    <div style="text-align:right; font-size:0.9em; color:{color}">{emoji} 空间: {diff:+.2f}%</div>
+                    <div style="text-align:right; font-size:0.9rem; color:{color};">
+                        {'🚀' if upside>0 else '⚠️'} 空间: {upside:+.2f}%
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
 
-        # 右侧：DCF 估值 + 仪表盘
-        with val_c2:
-            st.markdown("### 2️⃣ DCF 现金流估值 (绝对估值)")
-            st.markdown(f"基于 WACC **{user_wacc}%** 的内在价值计算")
+        with v_col2:
+            st.markdown("#### 🅱️ 绝对估值 (DCF法)")
+            st.caption(f"基于 WACC {user_discount_rate}% 现金流折现")
             
-            # DCF 大数字展示
-            dcf_color = "green" if dcf_upside > 0 else "red"
-            st.metric("DCF 内在价值", f"${dcf_val:.2f}", f"{dcf_upside:.2f}%")
+            dcf_upside = (dcf_val - curr_price) / curr_price * 100
+            dcf_color = get_color(dcf_val, curr_price)
             
-            # 仪表盘：当前价格 vs PE合理价 vs DCF合理价
-            avg_target = (pe_res['base'] + dcf_val) / 2
+            st.markdown(f"""
+            <div style="background:#1E1E25; border:2px solid {dcf_color}; border-radius:10px; padding:20px; text-align:center; margin-top:10px;">
+                <div style="color:#888; margin-bottom:5px;">DCF 内在价值</div>
+                <div style="font-size:2.5rem; font-weight:bold; color:{dcf_color};">${dcf_val:.2f}</div>
+                <div style="font-size:1.1rem; color:{dcf_color}; margin-top:5px;">
+                    {dcf_upside:+.2f}% 潜在空间
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
             
-            fig_gauge = go.Figure(go.Indicator(
-                mode = "gauge+number+delta",
-                value = current_price,
-                title = {'text': "当前价格 vs 综合目标", 'font': {'size': 15}},
-                delta = {'reference': avg_target, 'increasing': {'color': "red"}, 'decreasing': {'color': "green"}},
-                gauge = {
-                    'axis': {'range': [min(pe_res['bear'], dcf_val)*0.7, max(pe_res['bull'], dcf_val)*1.2]},
-                    'bar': {'color': "white", 'thickness': 0.2},
-                    'steps': [
-                        {'range': [0, pe_res['bear']], 'color': "#555555"}, # 极低区
-                        {'range': [pe_res['bear'], pe_res['bull']], 'color': "#222222"}  # 合理区间背景
-                    ],
-                    'threshold': {
-                        'line': {'color': "cyan", 'width': 4},
-                        'thickness': 0.8,
-                        'value': avg_target # 综合目标价
-                    }
-                }
-            ))
-            fig_gauge.update_layout(height=250, margin=dict(t=30, b=10, l=30, r=30))
-            st.plotly_chart(fig_gauge, use_container_width=True)
-            
-            st.info(f"💡 综合目标价 (PE中值 + DCF): **${avg_target:.2f}**")
+            # 综合建议
+            avg_price = (pe_vals['Base'] + dcf_val) / 2
+            st.info(f"⚖️ **综合参考价**: ${avg_price:.2f}")
 
-    else:
-        st.error("无法获取数据，请检查股票代码或网络连接。")
+        st.markdown("---")
+
+        # ==========================================
+        # Section 2: 技术分析 (Pro Chart)
+        # ==========================================
+        st.subheader("📉 关键点位透视")
+        
+        sr_data = calculate_sr_levels(hist, sensitivity=0.02)
+        supports = sorted([x for x in sr_data if x['price'] < curr_price], key=lambda x: x['price'], reverse=True)
+        resistances = sorted([x for x in sr_data if x['price'] > curr_price], key=lambda x: x['price'])
+        
+        c_tech1, c_tech2 = st.columns([3, 1])
+        
+        with c_tech1:
+            # Plotly 图表美化
+            plot_df = hist.iloc[-252:]
+            fig = go.Figure()
+            
+            # K线
+            fig.add_trace(go.Candlestick(
+                x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'],
+                name='Price', increasing_line_color='#00E676', decreasing_line_color='#FF1744'
+            ))
+            
+            # 均线
+            fig.add_trace(go.Scatter(
+                x=plot_df.index, y=plot_df['Close'].rolling(20).mean(), 
+                line=dict(color='#2979FF', width=1.5), name='MA20'
+            ))
+            
+            # SR 线
+            for s in supports[:3]:
+                fig.add_hline(y=s['price'], line_dash="dot", line_color="#00E676", opacity=0.6, annotation_text="Sup", annotation_position="top left")
+            for r in resistances[:3]:
+                fig.add_hline(y=r['price'], line_dash="dot", line_color="#FF1744", opacity=0.6, annotation_text="Res", annotation_position="bottom left")
+                
+            fig.update_layout(
+                height=500, 
+                margin=dict(l=10, r=10, t=30, b=10),
+                paper_bgcolor='rgba(0,0,0,0)', # 透明背景
+                plot_bgcolor='rgba(0,0,0,0)',
+                xaxis_rangeslider_visible=False,
+                font=dict(color="#A0A0A0"),
+                xaxis=dict(showgrid=False), # 去除网格
+                yaxis=dict(showgrid=True, gridcolor="#333")
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+        with c_tech2:
+            st.markdown("##### 🎯 关键位置")
+            
+            st.markdown("<div style='font-size:0.8rem; color:#FF1744; margin-top:10px;'>🔴 上方抛压</div>", unsafe_allow_html=True)
+            if resistances:
+                for r in resistances[:3]:
+                    st.markdown(f"<div style='border-bottom:1px solid #333; padding:5px; display:flex; justify-content:space-between;'><span>${r['price']:.1f}</span> <span>{'⭐'*min(r['strength'],3)}</span></div>", unsafe_allow_html=True)
+            else:
+                st.caption("上方无阻力")
+
+            st.markdown("<div style='font-size:0.8rem; color:#00E676; margin-top:20px;'>🟢 下方接盘</div>", unsafe_allow_html=True)
+            if supports:
+                for s in supports[:3]:
+                    st.markdown(f"<div style='border-bottom:1px solid #333; padding:5px; display:flex; justify-content:space-between;'><span>${s['price']:.1f}</span> <span>{'⭐'*min(s['strength'],3)}</span></div>", unsafe_allow_html=True)
+            else:
+                st.caption("深不见底")
